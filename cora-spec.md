@@ -1,6 +1,6 @@
 # Cora – Detailed Chunking and Retrieval Specification
 
-This document focuses on the **internals** of how Cora handles repository files and organizes them into chunks for retrieval-augmented generation. It supplements the core Cora endpoint descriptions found in `spec.md`. Unlike other code-aware retrieval services, Cora is a **separate project** that uses **Cojack** to access a checked out GitHub repository and reindex it in real time whenever code changes. Under the hood, Cora is implemented in **TypeScript** and relies on **Weaviate’s hybrid search** (vector + keyword) to power its retrieval.
+This document focuses on the **internals** of how Cora handles repository files and organizes them into chunks for retrieval-augmented generation. Cora uses **Cojack** to access a checked out GitHub repository and reindex it in real time whenever code changes. Under the hood, Cora is implemented in **TypeScript** and relies on **Weaviate’s hybrid search** (vector + keyword) to power its retrieval.
 
 ---
 
@@ -13,15 +13,17 @@ We emulate, at least initially, the techniques used by [aider’s](http://aider.
 2. **Parse out top-level (or near-top-level) declarations**—for example, functions, classes, methods.
 3. **Group small declarations into a single chunk** to avoid overly fragmenting the code.
 4. **Identify references** between declarations (e.g., function A calls function B).
-5. Store metadata (file name, line ranges, references, doc comments, etc.), plus embeddings (both raw code and optional commentary).
+5. Store metadata (file name, line ranges, references, doc comments, etc.), plus chunk embeddings.
 
 ### 1.2 Chunk Structure
 
 Cora treats each file as a **sequence of chunks**. The first chunk often includes any leading imports and top-level doc comments; subsequent chunks typically align with major declarations. Each chunk includes:
 
 1. **Metadata**: file name, line numbers, references, etc.  
-2. **Optional Commentary**: generated summary or docstring expansions intended to aid an LLM in understanding the chunk.  
+2. **Optional Commentary**: AI-generated summary or docstring expansions intended to aid an LLM in understanding the chunk.  
 3. **Content**: the actual code or text, using `...` (ellipsis) where content is elided for brevity.
+
+Cora is designed to support both AI-assisted code understanding and AI-assisted code editing. To support code editing, it returns complete verbatim source for high-relevance chunks of the code.
 
 #### 1.2.1 `<cora:chunk>` Format
 
@@ -45,14 +47,6 @@ A chunk is formatted as an XML-like element:
 - **`<cora:commentary>`**: A short summary or doc-like explanation.  
 - **`<cora:content>`**: The verbatim code or text, possibly elided (`. . .`) if content is lengthy.
 
-### 1.3 Commentary & Embedding
-
-During indexing, Cora may generate:
-- **Commentary Embedding**: Summaries or doc expansions that help the retrieval algorithm.  
-- **Raw Code Embedding**: The literal chunk text.  
-
-Storing both embeddings allows Cora to tailor searches for either direct code references or conceptual similarities gleaned from commentary.
-
 ---
 
 ## 2. Boost Directives & Advanced Retrieval
@@ -61,10 +55,6 @@ Beyond the basic “nearest chunks” approach, Cora supports **boost directives
 
 - **Explicit File Inclusion**: “Always include `README.md` fully.”  
 - **Declaration-Level Boosting**: “Return the entire `FooClass` implementation.”
-
-When assembling the final snippet:
-1. Cora merges the highest-scoring chunks from embedding searches (or from direct references).
-2. Any boosted chunks are forcibly included (subject to the overall length limit).
 
 ---
 
@@ -75,7 +65,7 @@ In addition to nearest-neighbor embedding searches, Cora includes a **relationsh
 2. **Referential Expansion**: If chunk A references chunk B, then B gets a “link-based” boost.  
 3. **Personalized PageRank**: The final set of chunks is determined by combining embedding scores + reference-based boosts.
 
-In other words, a chunk that is frequently referenced by your top results is more likely to be included, especially when you set a high “referenceFollow” parameter in future expansions.
+In other words, a chunk that is frequently referenced by your top results is more likely to be included.
 
 ---
 
@@ -90,17 +80,13 @@ For these file types, tree-sitter might be replaced or augmented by simpler chun
 
 ---
 
-## 5. Implementation Notes (Beyond `spec.md`)
+## 5. Implementation Notes
 
-1. **Elision Heuristics**: 
-   - For large declarations, Cora replaces internal lines with `...` to respect a chunk size limit.
-   - For smaller declarations, the entire body is typically shown.
-
-2. **Caching & Updates**:
+1. **Caching & Updates**:
    - Cora uses **Cojack** to detect file changes in real time. When major edits occur, Cora re-ingests or re-chunks the affected files.  
    - An initial MVP might refresh everything, while future iterations can do more incremental indexing based on Git diffs.
 
-3. **Multi-File Aggregation**:
+2. **Multi-File Aggregation**:
    - The final returned snippet may combine chunks from multiple files (or multiple repos in future expansions).
    - Cora unifies them under the same `<cora:chunk>`-based markup, ensuring an LLM can parse each chunk in context.
 
@@ -129,19 +115,17 @@ The MVP algorithm proceeds in **four phases**:
    - Build a list of chunks, each with metadata (`filepath`, `lineStart`, `lineEnd`, etc.) and the raw code snippet.  
 
 2. **Embed & Store**  
-   - For each chunk, generate **two** embeddings: one from the raw code snippet, one from a short “commentary” string (if applicable).  
-   - Store these embeddings and associated metadata in **Weaviate**, which supports vector search (and optional keyword search in its hybrid mode).
+   - For each chunk generate an embedding. (Our initial code embedding model is Voyage-code-3.) 
+   - Store the chunk context, embedding, and associated metadata in **Weaviate** for hybrid BM25/vector retrieval.
 
 3. **Query & Retrieval**  
    - For an incoming request:
      1. Determine the user’s query text (e.g., from an LLM conversation or direct request).
      2. Embed the query content with the same model used to embed chunks.
-     3. Perform a **hybrid similarity search** in Weaviate (vector + keyword) to fetch the top-K matching chunks, optionally applying reference expansions.  
-     4. Combine the final set of chunks into a `<cora:chunk>`-based text block for returning to the caller.
-
-4. **(Optional) PageRank Boost**  
-   - Once the top-K chunks are found, gather chunks that are heavily referenced by these top-K results.  
-   - Add them to the final set if the overall token limit (`approxLength`) permits.
+     3. Perform a **hybrid similarity search** in Weaviate (vector + keyword) to fetch the top-K matching chunks.
+     4. Apply reference expansion with page-rank scoring to pick up additional chunks.
+     5. Choose the higher-relevance chunks that will be included in their entirity in the response, versus lower-relevance chunks whose implementations will be elided.
+     6. Combine the final set of chunks into a `<cora:chunk>`-based text block for returning to the caller.
 
 ---
 
@@ -153,7 +137,7 @@ The MVP algorithm proceeds in **four phases**:
 
 2. **Extract Top-Level Declarations**  
    - Identify each function/class/method node.  
-   - Capture the source lines for each node; if a node is larger than a set threshold (e.g., 200 lines), consider splitting it further or eliding internal lines.
+   - Capture the entire source code for each node.
 
 3. **Build Chunk Metadata**  
    - For each chunk, store:
@@ -196,7 +180,7 @@ The MVP algorithm proceeds in **four phases**:
    - Retrieve chunk metadata and raw code for those matches.
 
 3. **Reference Expansion (Optional)**  
-   - If the user has a “referenceFollow” parameter > 0, gather references from the top-K chunks.  
+   - Gather references from the top-K chunks.  
    - Pull in additional chunks that are either directly referenced or appear in the same file.  
    - Limit the final set to `approxLength` tokens.
 
