@@ -4,10 +4,11 @@
 
 Cora offers:
 
-- **RAG Endpoint** compatible with OpenAI-style chat history.
+- **RAG Endpoint** compatible with OpenAI-style chat history, with advanced chunking and references.
 - **Multiple Repo Support**: local (checked-out) or directly from GitHub (both private and public).
 - **User Authentication & Repo Access Authorization**: ensures only permitted users/projects can query or modify repos.
 - **Real-Time Indexing**: uses **Cojack** to detect and reindex changed files on the fly.
+- **Sophisticated Chunking & Commentary**: each file is split into structured chunks, optionally including short summaries to improve retrieval quality.
 - **Simple Admin UI**: a browser-based interface for basic administration.  
 - **Integration-Friendly**: primarily designed to provide its RAG endpoint to external LLM tools.
 
@@ -18,7 +19,7 @@ Cora offers:
 - [Deno v2.1+](https://deno.land/) (if running natively)
 - [Docker](https://www.docker.com/) for the recommended containerized setup
 - An available [Weaviate](https://www.weaviate.io/) instance (local or remote)  
-- A cloned Git repository (or multiple repos) monitored by [Cojack](../cojack/README.md), **or** direct GitHub access for remote-only repos.
+- A cloned Git repository (or multiple repos) monitored by **Cojack**, **or** direct GitHub access for remote-only repos.
 
 ---
 
@@ -39,7 +40,7 @@ Cora offers:
 
 4. **RAG Endpoint**  
    - Cora’s main function is to provide a **Retrieval-Augmented Generation** service.  
-   - It **accepts OpenAI-compatible chat histories** as input, performs code snippet retrieval, and returns top-matching code chunks.
+   - It **accepts OpenAI-compatible chat histories** as input, performs code snippet retrieval (with advanced chunking and reference expansion), and returns top-matching code chunks.
 
 5. **Security & Authorization**  
    - Cora manages user authentication and checks whether each user can access a particular repo.  
@@ -48,6 +49,104 @@ Cora offers:
 6. **Admin UI**  
    - Cora provides a lightweight, browser-based admin interface for overseeing repos, usage, and configuration.  
    - However, the primary usage is via the programmatic RAG endpoint.
+
+---
+
+## How It Works: Chunking, Commentary & Retrieval
+
+Cora processes files by splitting them into *chunks*, each with associated metadata and (optionally) a short generated commentary. These chunks are stored with vector embeddings, enabling both semantic similarity and keyword-based lookups.
+
+- **Chunk Formation**:  
+  - For source code, Cora uses a language-aware approach (e.g., tree-sitter) to isolate major declarations or sections.  
+  - For non-code files (Markdown, YAML, etc.), heuristic-based splitting is used.  
+  - Chunks may elide large sections with `...` to keep them within size constraints.
+
+- **Embedding & Storage**:  
+  - Each chunk’s raw code (and optional AI-generated commentary) is embedded and stored in Weaviate.  
+  - Commentary can summarize or highlight a chunk’s purpose, improving conceptual matches.
+
+- **Reference Expansion**:  
+  - Chunks reference each other through calls, imports, or file-level relationships.  
+  - When you query, Cora finds top-N relevant chunks, then optionally pulls in neighbors by reference if they provide crucial context (e.g., a function definition that’s called by a top result).
+
+- **Boost Directives**:  
+  - You can hint that certain files or declarations are must-include or higher priority.  
+  - This ensures essential files (like core libraries or README) appear in the final snippet.
+
+---
+
+## RAG API Endpoints
+
+### `POST /cora/query`
+
+Cora’s principal retrieval endpoint. This accepts an OpenAI-style chat history, searches relevant repos, and returns a curated snippet of code or documentation in a `<cora:chunk>`-based format.
+
+#### Example Request Payload
+
+```json
+{
+  "messages": [
+    { "role": "system", "content": "You are a code-assistant." },
+    { "role": "user", "content": "Explain how concurrency logic works in repo A" }
+  ],
+  "approxLength": 8000,
+  "repos": [
+    {
+      "originUri": "http://github.com/organization/repoA",
+      "checkoutPath": "/path/to/repoA",
+      "versionSpecifier": "latest"
+    }
+  ],
+  "boostDirectives": {
+    "files": ["README.md"],
+    "declarations": [
+      {
+        "repoId": "repoA",
+        "path": "src/concurrency",
+        "includeImplementation": true
+      }
+    ]
+  }
+}
+```
+
+- **`messages`**: OpenAI-style conversation messages.  
+- **`approxLength`**: Soft limit (in characters) to keep the final code snippet or text within.  
+- **`repos`**: One or more repositories, each with a `checkoutPath` or remote Git reference.  
+- **`boostDirectives`** (optional): Tells Cora to prioritize or fully include certain files or declarations.
+
+#### Example Response
+
+```json
+{
+  "ragText": "<cora:chunk>...</cora:chunk>",
+  "metadata": { "sourcesUsed": ["src/concurrency/index.ts"] }
+}
+```
+
+- **`ragText`**: A single large string with `<cora:chunk>` elements. Each chunk includes `<cora:metadata>`, `<cora:commentary>` (optionally), and `<cora:content>`.  
+- **`metadata`**: Additional info, e.g. which files or lines were included.
+
+### `POST /cora/refresh`
+
+A housekeeping endpoint that prompts Cora to re-scan the specified repo(s). Useful when you suspect a major set of changes wasn’t automatically captured.
+
+#### Example Request Payload
+
+```json
+{
+  "repoPath": "/path/to/local-repo"
+}
+```
+
+#### Example Response
+
+```json
+{
+  "status": "ok",
+  "refreshed": true
+}
+```
 
 ---
 
@@ -96,42 +195,6 @@ If you want Cora to index repos **directly** from GitHub (public or private):
 
 ---
 
-## Basic RAG Endpoint
-
-### `POST /cora/query`
-
-- **Payload**: An **OpenAI-compatible** chat history. This is an array of messages in the form:
-  ```json
-  {
-    "messages": [
-      { "role": "system", "content": "You are a code-assistant." },
-      { "role": "user", "content": "Explain how the concurrency logic works." }
-    ],
-    "approxLength": 8000
-  }
-  ```
-- **Behavior**:  
-  1. Cora reads the user’s messages (particularly the last user message).  
-  2. Embeds the query content and searches Weaviate for relevant code chunks.  
-  3. Returns a JSON response containing the matched code blocks, each in `<cora:chunk>` format.
-
-### `POST /cora/refresh`
-
-- **Payload**:  
-  - A JSON object specifying which file(s) or directories changed. 
-  - Example:
-    ```json
-    {
-      "repoPath": "/path/to/local-repo",
-      "filesChanged": ["src/index.ts"]
-    }
-    ```
-- **Behavior**:  
-  1. Instructs Cora to re-chunk and reindex the specified files.  
-  2. Typically called by **Cojack** when it detects changes in a local Git repo.
-
----
-
 ## Example Workflow
 
 1. **Startup**  
@@ -140,11 +203,11 @@ If you want Cora to index repos **directly** from GitHub (public or private):
 
 2. **Indexing**  
    - On first run, Cora performs an initial full index of each tracked repo (local or remote).  
-   - Cora chunks source files using Tree-Sitter or fallback heuristics, then stores them in Weaviate.
+   - Cora chunks source files, optionally generates commentary, then stores them in Weaviate.
 
 3. **Query**  
-   - Send a `POST /cora/query` request with an OpenAI-style `messages` array.  
-   - Cora retrieves top-matching chunks from Weaviate, possibly expands references, and returns them.
+   - Send a `POST /cora/query` request with an OpenAI-style `messages` array (and optionally `boostDirectives`).  
+   - Cora retrieves top-matching chunks from Weaviate, may expand to reference-related chunks, and returns them.
 
 4. **Real-Time Updates**  
    - If you edit local repos, **Cojack** triggers `POST /cora/refresh`.  
@@ -152,6 +215,40 @@ If you want Cora to index repos **directly** from GitHub (public or private):
 
 5. **Admin UI**  
    - Navigate to the admin UI (URL shown in logs or Docker output) to see a list of repos, configure access tokens, or watch indexing status.
+
+---
+
+## Security & Potential Future Directions
+
+Cora’s initial security model supports:
+
+- **Token or Credential-Based Access**: A single access token or set of credentials that grants permission for queries or reindex operations.
+- **Repo-Level Authorization**: Configure which users or tokens can access which repos.
+
+Organizations needing more advanced security can adopt further enhancements without disrupting existing workflows:
+
+1. **User Accounts & Authentication**  
+   - Map tokens to unique user accounts.  
+   - Integrate with OAuth or SSO (e.g. GitHub, Google).  
+   - Session-based tokens or short-lifespan tokens.
+
+2. **Fine-Grained Authorization**  
+   - Per-repo roles (reader, contributor, admin).  
+   - Directory or file-level rules.
+
+3. **Auditing & Logging**  
+   - Query logs tracking who asked what, when.  
+   - Access traces to see which files or chunks were retrieved.
+
+4. **Secure Access Enforcement**  
+   - TLS/SSL in front of Cora.  
+   - Deploy behind a VPN or private subnetwork.
+
+5. **Multi-Tenant Caching**  
+   - Shared repo caches for teams.  
+   - Separate caching for private, per-user repos.
+
+These future directions provide a path to robust enterprise-grade security while preserving a simple default setup for small teams or local use.
 
 ---
 
@@ -181,13 +278,13 @@ You can then run `./cora` (or equivalent) with necessary environment variables s
 Cora’s tests rely on **Deno’s built-in test framework**:
 
 1. **Unit Tests**  
-   - Focus on chunking, reference expansion, embeddings, etc.
+   - Validate chunk parsing, commentary generation, reference linking, and embedding.
 2. **Integration Tests**  
    - Launch a local in-memory server for API tests.
    - Optionally mock Weaviate or use a test instance to confirm end-to-end flows.
 3. **End-to-End (E2E) Tests**  
    - Run both Cora and Cojack together.
-   - Verify real-time indexing.
+   - Verify real-time indexing and chunk updates.
 
 ```bash
 deno test --allow-net --allow-read
@@ -212,7 +309,7 @@ We welcome contributions! Please:
 
 - **Modern, idiomatic TypeScript**: minimal dependencies, functional approach where possible.
 - **Cross-Platform**: run on Linux, macOS, and Windows.  
-- **Security & Authorization**: ensure PRs maintain authentication and permission checks.
+- **Security & Authorization**: ensure PRs maintain or improve the authentication and permission checks described above.
 
 Before making a PR, run:
 
