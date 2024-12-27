@@ -31,8 +31,9 @@ Cora offers:
    - Cora is commonly packaged in Docker along with a **local Weaviate** instance. By default, the Weaviate instance stores index data on the host filesystem, so your state is preserved between container restarts.
 
 2. **Multi-Repo Support**  
-   - A single Cora instance can track multiple **project directories** (checked-out GitHub repos) via **Cojack**, which notifies Cora of file changes.  
-   - Cora can also fetch data directly from GitHub repositories (both private and public), performing indexing without requiring local checkouts.
+   - A single Cora instance can track one checked-out git repo via **Cojack**, which notifies Cora of file changes.  
+   - Future: We intend Cora to support multiple **project directories** (checked-out GitHub repos) 
+   - Future: We intend Cora to support fetching data directly from GitHub repositories (both private and public), performing indexing without requiring local checkouts.
 
 3. **Continuous Real-Time Indexing**  
    - **Cojack** monitors code changes in your Git repos and triggers reindex calls to Cora.  
@@ -49,6 +50,38 @@ Cora offers:
 6. **Admin UI**  
    - Cora provides a lightweight, browser-based admin interface for overseeing repos, usage, and configuration.  
    - However, the primary usage is via the programmatic RAG endpoint.
+
+---
+
+## Security & Potential Future Directions
+
+Cora’s initial security model supports:
+
+- **Token or Credential-Based Access**: A single access token or set of credentials that grants permission for queries or reindex operations.
+- **Repo-Level Authorization**: Configure which users or tokens can access which repos.
+
+Future: we expect to support organizations with more complex security requirements, including:
+
+1. **User Accounts & Authentication**  
+   - Map tokens to unique user accounts.  
+   - Integrate with OAuth or SSO (e.g. GitHub, Google).  
+   - Session-based tokens or short-lifespan tokens.
+
+2. **Fine-Grained Authorization**  
+   - Per-repo roles (reader, contributor, admin).  
+   - Directory or file-level rules.
+
+3. **Auditing & Logging**  
+   - Query logs tracking who asked what, when.  
+   - Access traces to see which files or chunks were retrieved.
+
+4. **Secure Access Enforcement**  
+   - TLS/SSL in front of Cora.  
+   - Deploy behind a VPN or private subnetwork.
+
+5. **Multi-Tenant Caching**  
+   - Shared repo caches for teams.  
+   - Separate caching for private, per-user repos.
 
 ---
 
@@ -119,13 +152,56 @@ Cora’s principal retrieval endpoint. This accepts an OpenAI-style chat history
 
 ```json
 {
-  "ragText": "<cora:chunk>...</cora:chunk>",
+  "ragResult": "",
   "metadata": { "sourcesUsed": ["src/concurrency/index.ts"] }
 }
 ```
 
-- **`ragText`**: A single large string with `<cora:chunk>` elements. Each chunk includes `<cora:metadata>`, `<cora:commentary>` (optionally), and `<cora:content>`.  
+- **`ragResult`**: A single large string formatted as shown below 
 - **`metadata`**: Additional info, e.g. which files or lines were included.
+
+`ragResult` provides the AI with an elided view across repos and files. RAG results are formatted as informal XML, using XML-style tags but not otherwise following XML syntax.
+
+Here is the top-level structure. The XML comments are included in actual RAG results to explain this structure to the AI. Adjacent file chunks are merged in the RAG result. When an entire file is returned, its content appears in a `<cora:content>` element directly under the `<cora:file>` element.
+
+```xml
+<cora:rag-result>
+  <!--
+  This code RAG result provides the most relevant source file exerpts for this point in the chat. 
+  <cora:content> elements contain verbatim excerpts of the latest file contents, as they
+    appear right now on disk or in the repo, except that some line ranges may be elided by ". . ."
+  <cora:commentary> elements contain AI-generated prose explanations that were generated at indexing time
+  -->
+
+  <cora:repo origin="https://github.com/example/repo" 
+             git-commit-hash="..."
+             checkout-host="ledge" checkout-path="/home/deansher/projects/example/repo">
+    <cora:file path="src/example.ts" git-status="modified">
+      <cora:chunk lines="10-36">
+        ...
+      </cora:chunk>
+    </cora:file>
+    ...
+  </cora:repo>
+  ...
+</cora:rag-result>
+```
+
+Here is the structure of a chunk:
+
+```xml
+<cora:chunk lines="10-36">
+  <cora:commentary>
+    This function handles concurrency logic, using a shared state manager.
+  </cora:commentary>
+  <cora:content>
+export function runTaskQueue() {
+// ...
+}
+...
+  </cora:content>
+</cora:chunk>
+```
 
 ### `POST /cora/refresh`
 
@@ -218,40 +294,6 @@ If you want Cora to index repos **directly** from GitHub (public or private):
 
 ---
 
-## Security & Potential Future Directions
-
-Cora’s initial security model supports:
-
-- **Token or Credential-Based Access**: A single access token or set of credentials that grants permission for queries or reindex operations.
-- **Repo-Level Authorization**: Configure which users or tokens can access which repos.
-
-Organizations needing more advanced security can adopt further enhancements without disrupting existing workflows:
-
-1. **User Accounts & Authentication**  
-   - Map tokens to unique user accounts.  
-   - Integrate with OAuth or SSO (e.g. GitHub, Google).  
-   - Session-based tokens or short-lifespan tokens.
-
-2. **Fine-Grained Authorization**  
-   - Per-repo roles (reader, contributor, admin).  
-   - Directory or file-level rules.
-
-3. **Auditing & Logging**  
-   - Query logs tracking who asked what, when.  
-   - Access traces to see which files or chunks were retrieved.
-
-4. **Secure Access Enforcement**  
-   - TLS/SSL in front of Cora.  
-   - Deploy behind a VPN or private subnetwork.
-
-5. **Multi-Tenant Caching**  
-   - Shared repo caches for teams.  
-   - Separate caching for private, per-user repos.
-
-These future directions provide a path to robust enterprise-grade security while preserving a simple default setup for small teams or local use.
-
----
-
 ## Building an Executable (Optional)
 
 For those who prefer a single executable:
@@ -307,9 +349,10 @@ We welcome contributions! Please:
 
 ### Project Style
 
-- **Modern, idiomatic TypeScript**: minimal dependencies, functional approach where possible.
+- **Modern, idiomatic TypeScript**: prefer a functional style with immutable data structures.
+- **Deno-First**: use Deno's built-in features and standard libraries.
 - **Cross-Platform**: run on Linux, macOS, and Windows.  
-- **Security & Authorization**: ensure PRs maintain or improve the authentication and permission checks described above.
+- **Security & Authorization**: ensure every PR maintains or improve Cora's security
 
 Before making a PR, run:
 
