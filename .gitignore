@@ -134,3 +134,10 @@ dist
 
 .history*
 .aider*
+
+.DS_Store
+.env
+coverage/
+dist/
+.vscode/
+*.log
