@@ -1,20 +1,160 @@
 import weaviate, { configure } from 'weaviate-client';
 const { dataType, vectorizer } = configure;
 
-/**
- * Extended CodeChunk class:
- * - Adds repo/commit/contentHash for precise referencing
- * - Replaces 'references' text array with:
- *   -- referenceSymbols: a TEXT_ARRAY of raw symbol/import references
- *   -- referenceChunks: cross-references to other CodeChunk objects
- */
-const coraSchema = {
-  class: 'CodeChunk',
-  // Use OpenAI vectorizer for code
-  vectorizer: 'text2vec-openai',
-  // Optionally specify how the vector index calculates distance
-  vectorIndexConfig: {
-    distance: 'cosine',
+const contentEntityDefinitionSchema = {
+    class: 'ContentEntityDefinition',
+    properties: [
+      {
+        name: 'identifier',
+        dataType: ['text'],
+        description: 'The name or heading of this entity (function name, class name, doc section, etc.)',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'entityType',
+        dataType: ['text'],
+        description: 'High-level type: function, class, markdownSection, etc.',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'fileVersion',
+        dataType: ['FileVersion'],
+        description: 'Reference to the specific FileVersion in which this definition appears',
+      },
+  
+      // The defining side knows lines and file path
+      {
+        name: 'filePath',
+        dataType: ['text'],
+        description: 'The file path for this definition, typically redundant with fileVersion but convenient.',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'lineStart',
+        dataType: ['int'],
+        description: 'Line number where the definition starts',
+        indexFilterable: true,
+      },
+      {
+        name: 'lineEnd',
+        dataType: ['int'],
+        description: 'Line number where the definition ends',
+        indexFilterable: true,
+      },
+      {
+        name: 'definedInChunk',
+        dataType: ['Chunk'],
+        description: 'Optional reference to the chunk that physically contains the definition',
+      },
+  
+      // Additional optional metadata
+      // e.g., "modulePath", "namespace", "visibility" (public/private), "language", etc.
+    ],
+  };
+  
+  const contentEntityReferenceSchema = {
+    class: 'ContentEntityReference',
+    properties: [
+      {
+        name: 'identifierUsed',
+        dataType: ['text'],
+        description: 'The literal name or heading used in the referencing code or doc. E.g., "fooMethod".',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'referenceType',
+        dataType: ['text'],
+        description: 'call, import, link, reexport, mention, etc.',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'fileVersion',
+        dataType: ['FileVersion'],
+        description: 'The version of the file in which this reference occurs',
+      },
+  
+      // The referencing side knows only its own location
+      {
+        name: 'filePath',
+        dataType: ['text'],
+        description: 'The referencing file path (optional if implied by fileVersion)',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'lineStart',
+        dataType: ['int'],
+        description: 'Line where this reference is used',
+        indexFilterable: true,
+      },
+      {
+        name: 'lineEnd',
+        dataType: ['int'],
+        description: 'Line range end for the usage',
+        indexFilterable: true,
+      },
+      {
+        name: 'appearsInChunk',
+        dataType: ['Chunk'],
+        description: 'Reference to the chunk containing this usage, if you want chunk-level linking',
+      },
+  
+      // Other optional fields
+      // e.g. "importPath" for an import statement, or "hyperlink" for doc references
+    ],
+  };
+
+  const fileVersionSchema = {
+    class: 'FileVersion',
+    properties: [
+      {
+        name: 'repoId',
+        dataType: [dataType.TEXT],
+        description: 'Repository identifier',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'projectDir',
+        dataType: [dataType.TEXT],
+        description: 'Project directory path',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'filePath',
+        dataType: [dataType.TEXT],
+        description: 'Path to the file within the project',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'contentHash',
+        dataType: [dataType.TEXT],
+        description: 'Hash of the file content',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'chunks',
+        dataType: ['Chunk'],
+        description: 'Associated code chunks from this file version',
+      }
+    ]
+  };
+  
+  const chunkSchema = {
+  class: 'Chunk',
+  namedVectors: {
+    embed_formatted_voyage_c3: {
+      vectorizer: 'none',
+      dimension: 2048
+    }
   },
   // Properties define the shape of each chunk
   properties: [
@@ -32,13 +172,6 @@ const coraSchema = {
       indexSearchable: true,
     },
     {
-      name: 'filePath',
-      dataType: [dataType.TEXT],
-      description: 'Path to the source file',
-      indexFilterable: true,
-      indexSearchable: true,
-    },
-    {
       name: 'repoId',
       dataType: [dataType.TEXT],
       description: 'An identifier for the repository this chunk comes from',
@@ -46,11 +179,11 @@ const coraSchema = {
       indexSearchable: true,
     },
     {
-      name: 'commitHash',
-      dataType: [dataType.TEXT],
-      description: 'Commit hash for the version of this file chunk',
-      indexFilterable: true,
-      indexSearchable: true,
+        name: 'filePath',
+        dataType: [dataType.TEXT],
+        description: 'Path to the source file',
+        indexFilterable: true,
+        indexSearchable: true,
     },
     {
       name: 'contentHash',
@@ -95,35 +228,61 @@ const coraSchema = {
     },
     {
       name: 'referenceChunks',
-      dataType: ['CodeChunk'],
-      description: 'Cross-reference to other CodeChunks this chunk calls or depends on',
+      dataType: ['Chunk'],
+      description: 'Cross-reference to other Chunks this chunk calls or depends on',
     },
-  ],
-  moduleConfig: {
-    'text2vec-openai': {
-      model: 'code-davinci-002',
-      modelVersion: '002',
-      type: 'code',
-      // Optionally tweak the vectorization settings
-      // e.g. temperature, maxTokens, etc. if your Weaviate instance supports them
-    },
-  },
-};
+    {
+        name: 'fileVersion',
+        dataType: ['FileVersion'],
+        description: 'Reference to the FileVersion this chunk belongs to',
+    }
+],
+};  
 
-// Creating the schema in Weaviate
-export async function createCoraSchema(client: weaviate.Client) {
-  try {
-    // Drop existing class if you need a clean slate:
-    // await client.schema.classDeleter().withClassName('CodeChunk').do();
+const commitFileVersionSchema = {
+    class: 'CommitFileVersion',
+    properties: [
+      {
+        name: 'commitHash',
+        dataType: [dataType.TEXT],
+        description: 'Git commit hash',
+        indexFilterable: true,
+        indexSearchable: true,
+      },
+      {
+        name: 'fileVersion',
+        dataType: ['FileVersion'],
+        description: 'Reference to the associated FileVersion',
+      },
+      {
+        name: 'timestamp',
+        dataType: [dataType.DATE],
+        description: 'Commit timestamp',
+        indexFilterable: true,
+      }
+    ]
+  };
 
-    await client.schema
-      .classCreator()
-      .withClass(coraSchema as any) // cast if needed
-      .do();
-
-    console.log('CodeChunk schema created successfully.');
-  } catch (err) {
-    console.error('Error creating CodeChunk schema:', err);
-    throw err;
+  export async function createAllSchemas(client: weaviate.Client) {
+    try {
+      await client.schema
+        .classCreator()
+        .withClass(chunkSchema as any)
+        .do();
+      
+      await client.schema
+        .classCreator()
+        .withClass(fileVersionSchema as any)
+        .do();
+        
+      await client.schema
+        .classCreator()
+        .withClass(commitFileVersionSchema as any)
+        .do();
+  
+      console.log('All schemas created successfully.');
+    } catch (err) {
+      console.error('Error creating schemas:', err);
+      throw err;
+    }
   }
-}
